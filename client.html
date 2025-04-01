@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GStreamer WebRTC Client</title>
+  <style>
+    body { font-family: sans-serif; }
+    #video {
+      width: 640px;
+      height: 360px;
+      background: black;
+    }
+  </style>
+</head>
+<body>
+  <h1>GStreamer WebRTC Test</h1>
+  <video id="remoteVideo" autoplay playsinline controls></video>
+  <div>
+    <button id="startBtn">Start WebSocket</button>
+    <p id="status"></p>
+  </div>
+
+  <script>
+    const signalingUrl = "ws://localhost:8765"; // or wherever your server is
+
+    let pc;                // RTCPeerConnection
+    let ws;                // WebSocket
+    let remoteVideo;       // HTMLVideoElement
+    let statusElem;        // Paragraph to display status messages
+
+    window.onload = () => {
+      remoteVideo = document.getElementById("remoteVideo");
+      statusElem = document.getElementById("status");
+
+      document.getElementById("startBtn").onclick = startWebSocket;
+    };
+
+    function logStatus(message) {
+      console.log(message);
+      if (statusElem) {
+        statusElem.innerText = message;
+      }
+    }
+
+    function startWebSocket() {
+      logStatus("Connecting to signaling server...");
+
+      ws = new WebSocket(signalingUrl);
+      ws.onopen = () => {
+        logStatus("WebSocket connected. Waiting for offer...");
+      };
+
+      ws.onmessage = async (evt) => {
+        const msg = JSON.parse(evt.data);
+
+        if (msg.type === "offer") {
+          logStatus("Received offer from server (GStreamer).");
+
+          // Create a new RTCPeerConnection
+          createPeerConnection();
+
+          const offerDesc = new RTCSessionDescription({
+            type: "offer",
+            sdp: msg.sdp
+          });
+
+          // Set remote description
+          await pc.setRemoteDescription(offerDesc);
+          logStatus("Remote description set. Creating answer...");
+
+          // Create answer
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          // Send answer via WebSocket
+          const answerMsg = {
+            type: "answer",
+            sdp: answer.sdp
+          };
+          ws.send(JSON.stringify(answerMsg));
+          logStatus("Sent answer back to server.");
+        }
+        else if (msg.type === "ice") {
+          // Received remote ICE candidate from GStreamer
+          const candidate = new RTCIceCandidate({
+            sdpMid: msg.sdpMid, // Sometimes omitted in your Python, check if needed
+            sdpMLineIndex: msg.sdpMLineIndex,
+            candidate: msg.candidate
+          });
+          try {
+            await pc.addIceCandidate(candidate);
+            console.log("Added remote ICE candidate:", candidate);
+          } catch (err) {
+            console.warn("Error adding remote ICE candidate", err);
+          }
+        }
+      };
+
+      ws.onclose = () => {
+        logStatus("WebSocket closed.");
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+      };
+    }
+
+    function createPeerConnection() {
+      // Provide at least one STUN server
+      const config = {
+        iceServers: [
+          { urls: ["stun:stun.l.google.com:19302"] }
+        ]
+      };
+
+      pc = new RTCPeerConnection(config);
+
+      // ICE candidates from browser to GStreamer
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          const msg = {
+            type: "ice",
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+            candidate: event.candidate.candidate,
+          };
+          ws.send(JSON.stringify(msg));
+          console.log("Sent ICE candidate to server:", msg);
+        }
+      };
+
+      // When remote track arrives, attach it to video
+      pc.ontrack = (event) => {
+        console.log("Received remote track:", event.streams[0]);
+        remoteVideo.srcObject = event.streams[0];
+      };
+
+      // If you want to send your own local stream, you could do pc.addTrack(...) with a local camera track
+      // For a one-way from GStreamer, no local track is needed.
+    }
+  </script>
+</body>
+</html>
