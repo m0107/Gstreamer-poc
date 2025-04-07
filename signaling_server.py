@@ -1,14 +1,15 @@
-# signaling_server.py
+#!/usr/bin/env python3
 import asyncio
 import websockets
 import json
 
 clients = set()
 
-async def handler(websocket, path):
+async def handler(websocket):
     clients.add(websocket)
     try:
         async for message in websocket:
+            # Broadcast message to all other clients
             for client in clients:
                 if client != websocket:
                     await client.send(message)
@@ -17,8 +18,10 @@ async def handler(websocket, path):
     finally:
         clients.remove(websocket)
 
-start_server = websockets.serve(handler, "0.0.0.0", 8765)
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", 8765):
+        print("Signaling server running at ws://localhost:8765")
+        await asyncio.Future()  # Run forever
 
-asyncio.get_event_loop().run_until_complete(start_server)
-print("Signaling server running at ws://localhost:8765")
-asyncio.get_event_loop().run_forever()
+if __name__ == "__main__":
+    asyncio.run(main())

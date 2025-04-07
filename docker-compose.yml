@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  rtsp-server:
+    image: aler9/rtsp-simple-server:latest
+    container_name: rtsp-server
+    ports:
+      - "8554:8554"
+
+  streamer:
+    build: .
+    container_name: ffmpeg-streamer
+    depends_on:
+      - rtsp-server

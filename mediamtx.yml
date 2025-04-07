@@ -1,0 +1,13 @@
+logLevel: info
+
+rtsp:
+  enabled: true
+  readTimeout: 60s
+  writeTimeout: 60s
+  protocols:
+    - tcp
+
+paths:
+  all:
+    source: publisher
+    sourceOnDemand: false
