@@ -3,9 +3,10 @@ import json
 import websockets
 import gbulb
 import gi
+import threading
 import subprocess
 import os
-import uuid  # <-- Import uuid to generate unique names for fakesinks
+import uuid  # Used for naming fakesinks uniquely
 
 # GStreamer initialization
 gi.require_version("Gst", "1.0")
@@ -16,18 +17,31 @@ from gi.repository import Gst, GstSdp, GstWebRTC, GstRtsp
 
 gbulb.install()
 
+# Settings
 SIGNALING_SERVER = "ws://localhost:8765"
 CAMERA_URL = "rtsp://admin:Password@192.168.0.201:554/Streaming/channels/101"
+
+# Globals
 pipeline = None
 webrtcbin = None
 ws = None
 main_loop = None
 pending_offer_sdp = None
+start_time = None  # For forced timestamping (if needed)
 
-start_time = None  # Global variable for the forced timestamp logic
+def trigger_renegotiation_if_needed():
+    global webrtcbin, ws, main_loop
+    # Check if a local description is already set.
+    # local_desc = webrtcbin.get_property("local-description")
+    # if local_desc is None:
+    print("[DEBUG] No local description set, triggering renegotiation now.")
+    promise = Gst.Promise.new_with_change_func(on_offer_created, webrtcbin, None)
+    webrtcbin.emit("create-offer", None, promise)
+    # else:
+        # print("[DEBUG] Local description already present, renegotiation not needed.")
+
 
 # ----- Probes and Callbacks -----
-
 def force_timestamp_probe(pad, info):
     global start_time
     if info.type & Gst.PadProbeType.BUFFER:
@@ -46,15 +60,15 @@ def force_timestamp_probe(pad, info):
 def log_timestamp_probe(pad, info):
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
-        if buf:
-            print(f"[TIMESTAMP LOG] PTS: {buf.pts}, DTS: {buf.dts}, Size: {buf.get_size()} bytes")
+        # if buf:
+        #     print(f"[TIMESTAMP LOG] PTS: {buf.pts}, DTS: {buf.dts}, Size: {buf.get_size()} bytes")
     return Gst.PadProbeReturn.OK
 
 def log_probe(pad, info):
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
-        if buf:
-            print(f"[LOG PROBE] Buffer at {pad.get_name()}; size: {buf.get_size()} bytes, PTS: {buf.pts}")
+        # if buf:
+        #     print(f"[LOG PROBE] Buffer at {pad.get_name()}; size: {buf.get_size()} bytes, PTS: {buf.pts}")
     return Gst.PadProbeReturn.OK
 
 def has_audio_stream(rtsp_url):
@@ -73,29 +87,25 @@ def check_elem(name, elem):
     print(f"[DEBUG] Created element: {name}")
     return elem
 
+import threading
+
 def on_pad_added(src, new_pad, target_elem):
     """
-    Link the dynamic pad from rtspsrc to either:
-       - The sink pad of target_elem if the pad’s caps is "application/x-rtp" (RTP stream),
-       - Or to a newly created fakesink if it is not RTP (typically RTCP).
+    Link the dynamic pad from rtspsrc. If the pad is RTP (caps "application/x-rtp"),
+    link it to the target element (typically an identity). Otherwise (e.g. RTCP),
+    link it to a fakesink so that data is consumed.
     """
     print(f"[DEBUG] on_pad_added: Detected new pad {new_pad.get_name()} from {src.get_name()}")
-
-    # Query the capabilities of the new pad.
-    caps = new_pad.get_current_caps()
-    if not caps:
-        caps = new_pad.query_caps(None)
+    caps = new_pad.get_current_caps() or new_pad.query_caps(None)
     structure = caps.get_structure(0)
     pad_type = structure.get_name()
 
     if pad_type != "application/x-rtp":
-        # For non-RTP pads (e.g., RTCP), create a fakesink to consume the data.
-        print(f"[DEBUG] Non-RTP pad detected ({pad_type}); linking {new_pad.get_name()} to fakesink.")
+        print(f"[DEBUG] Non-RTP pad detected ({pad_type}); linking {new_pad.get_name()} to a fakesink.")
         fakesink = Gst.ElementFactory.make("fakesink", f"fakesink_{uuid.uuid4().hex}")
         if not fakesink:
             print("[ERROR] Could not create fakesink for non-RTP pad.")
             return
-        # Add the fakesink to the pipeline.
         pipeline.add(fakesink)
         fakesink.sync_state_with_parent()
         sink_pad = fakesink.get_static_pad("sink")
@@ -103,23 +113,27 @@ def on_pad_added(src, new_pad, target_elem):
         if ret == Gst.PadLinkReturn.OK:
             print(f"[INFO] Successfully linked non-RTP pad {new_pad.get_name()} to fakesink.")
         else:
-            print(f"[ERROR] Failed to link non-RTP pad {new_pad.get_name()} to fakesink (error code: {ret}).")
+            print(f"[ERROR] Failed to link non-RTP pad {new_pad.get_name()} (error code: {ret}).")
         return
 
-    # Otherwise, the pad is RTP and we link it to the target element.
+    # For RTP pads, link it to the target element (the identity element).
     sink_pad = target_elem.get_static_pad("sink")
     if not sink_pad:
         print("[ERROR] Target element does not have a sink pad.")
         return
     if sink_pad.is_linked():
-        print("[WARNING] Sink pad already linked; ignoring new pad.")
+        print("[WARNING] Target sink pad already linked; ignoring new pad.")
         return
 
     ret = new_pad.link(sink_pad)
     if ret == Gst.PadLinkReturn.OK:
         print("[INFO] Successfully linked dynamic RTP pad to identity element.")
+
+        # Trigger renegotiation after 500 ms to allow media to flow.
+        threading.Timer(3.0, trigger_renegotiation_if_needed).start()
     else:
         print(f"[ERROR] Failed to link dynamic pad {new_pad.get_name()} (error code: {ret}).")
+
 
 def link_many(*elements):
     for i in range(len(elements) - 1):
@@ -131,7 +145,7 @@ def link_many(*elements):
 
 def link_webrtc_branch(pad, info, capsfilter, webrtc):
     if info.get_event().type == Gst.EventType.CAPS:
-        print("[DEBUG] CAPS detected; linking payloader to webrtcbin...")
+        print("[DEBUG] CAPS detected in WebRTC branch; linking payloader to webrtcbin...")
         pad.link(capsfilter.get_static_pad("sink"))
         capsfilter.get_static_pad("src").link(webrtc.get_request_pad("sink_%u"))
         print("[INFO] Linked RTP payloader -> capsfilter -> webrtcbin")
@@ -139,7 +153,6 @@ def link_webrtc_branch(pad, info, capsfilter, webrtc):
     return Gst.PadProbeReturn.OK
 
 # ----- Pipeline Creation -----
-
 def create_pipeline():
     global pipeline, webrtcbin
     print("[INFO] Creating pipeline...")
@@ -147,27 +160,28 @@ def create_pipeline():
     audio_present = has_audio_stream(CAMERA_URL)
     print(f"[INFO] Audio present in stream: {audio_present}")
 
-    # --- Video Branch ---
+    # --- Common Video Branch ---
     src = check_elem("rtspsrc", Gst.ElementFactory.make("rtspsrc", "src"))
     src.set_property("location", CAMERA_URL)
     src.set_property("latency", 300)
-
-    # Create identity element to insert into the video branch.
+    
     identity_timestamp = check_elem("identity", Gst.ElementFactory.make("identity", "identity_timestamp"))
     pipeline.add(identity_timestamp)
     
-    # Connect dynamic pad from RTSP source to identity element.
+    # Connect dynamic pad from src.
     src.connect("pad-added", on_pad_added, identity_timestamp)
     
-    # Optionally enable forced timestamping (commented for now)
+    # Optionally, enable forced timestamping by uncommenting the line below.
     # identity_timestamp.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, force_timestamp_probe)
 
-    # Create downstream video elements.
     depay = check_elem("rtph265depay", Gst.ElementFactory.make("rtph265depay", "depay"))
     h265parse = check_elem("h265parse", Gst.ElementFactory.make("h265parse", "h265parse"))
     h265parse.set_property("config-interval", 2)
     tee = check_elem("tee", Gst.ElementFactory.make("tee", "tee"))
+    
+    # --- Recording Branch ---
     queue_rec = check_elem("queue", Gst.ElementFactory.make("queue", "queue_record"))
+    queue_rec.set_property("max-size-buffers", 300)
     
     rec_parse = check_elem("h265parse", Gst.ElementFactory.make("h265parse", "record_parse"))
     rec_parse.set_property("config-interval", 1)
@@ -179,63 +193,65 @@ def create_pipeline():
     fsink.set_property("sync", False)
     fsink.set_property("async", False)
 
-    # --- WebRTC Branch Elements (for later testing) ---
+    # --- WebRTC Branch ---
     queue_webrtc = check_elem("queue", Gst.ElementFactory.make("queue", "queue_webrtc"))
+    queue_webrtc.set_property("max-size-buffers", 300)
+    # Make the WebRTC queue leaky so that if its branch backs up it drops buffers downstream.
+    queue_webrtc.set_property("leaky", 1)
+    
     pay = check_elem("rtph265pay", Gst.ElementFactory.make("rtph265pay", "pay"))
     pay.set_property("pt", 96)
     pay.set_property("config-interval", 1)
+    
     capsfilter = check_elem("capsfilter", Gst.ElementFactory.make("capsfilter", "capsfilter"))
-    caps = Gst.Caps.from_string("application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96")
+    caps_text = "application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96"
+    caps = Gst.Caps.from_string(caps_text)
     capsfilter.set_property("caps", caps)
+    
     webrtc = check_elem("webrtcbin", Gst.ElementFactory.make("webrtcbin", "webrtcbin"))
     webrtc.set_property("stun-server", "stun://stun.l.google.com:19302")
 
-    # Add elements to the pipeline using get_by_name() to avoid duplicate additions.
+    # Add all elements to the pipeline.
     for elem in (src, identity_timestamp, depay, h265parse, tee, queue_rec,
                  rec_parse, mux, fsink, queue_webrtc, pay, capsfilter, webrtc):
         if elem is not None and pipeline.get_by_name(elem.get_name()) is None:
             pipeline.add(elem)
 
-    # [Rest of the pipeline linking code...]
-    # (Linking video branch, recording branch, dummy audio branch, etc.)
-    # For example, to link the video branch:
+    # --- Linking Branches ---
+    # Link common video branch: identity -> depay -> h265parse -> tee.
     if not link_many(identity_timestamp, depay, h265parse, tee):
         raise RuntimeError("[FATAL] Failed to link the primary video branch.")
 
+    # Recording branch: request a tee pad to queue_rec, then to rec_parse -> mux -> fsink.
     tee_src_pad = tee.get_request_pad("src_%u")
     queue_rec_sink_pad = queue_rec.get_static_pad("sink")
-    tee_src_pad.link(queue_rec_sink_pad)
-
-    # Add a pad probe to monitor buffer flow on the recording branch.
-    queue_rec.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, log_probe)
-
+    if tee_src_pad.link(queue_rec_sink_pad) != Gst.PadLinkReturn.OK:
+        raise RuntimeError("[FATAL] Failed to link tee to recording queue.")
     if not link_many(queue_rec, rec_parse):
         raise RuntimeError("[FATAL] Failed to link recording branch: queue_rec -> rec_parse")
-
     video_src_pad = rec_parse.get_static_pad("src")
     video_pad = mux.get_request_pad("sink_%d")
     if not video_src_pad or not video_pad:
         raise RuntimeError("[FATAL] Could not retrieve pads for video linking.")
     if video_src_pad.link(video_pad) != Gst.PadLinkReturn.OK:
         raise RuntimeError("[FATAL] Failed to link video stream to mux.")
-    link_many(mux, fsink)
+    if not link_many(mux, fsink):
+        raise RuntimeError("[FATAL] Failed to link mux to filesink.")
 
-    # --- WebRTC Branch (temporarily disable for testing recording) ---
-    # Uncomment below after confirming recording branch works.
-    #
-    # if not link_many(tee, queue_webrtc, pay):
-    #     raise RuntimeError("[FATAL] Failed to link WebRTC branch: tee -> queue_webrtc -> pay")
-    # pay.get_static_pad("src").add_probe(
-    #     Gst.PadProbeType.EVENT_DOWNSTREAM,
-    #     lambda pad, info: link_webrtc_branch(pad, info, capsfilter, webrtc)
-    # )
-    # webrtcbin = webrtc
+    # WebRTC branch: link tee -> queue_webrtc -> pay.
+    if not link_many(tee, queue_webrtc, pay):
+        raise RuntimeError("[FATAL] Failed to link WebRTC branch: tee -> queue_webrtc -> pay")
+    # Set a pad probe on payloader's src pad to link it further into capsfilter and webrtcbin.
+    pay.get_static_pad("src").add_probe(
+        Gst.PadProbeType.EVENT_DOWNSTREAM,
+        lambda pad, info: link_webrtc_branch(pad, info, capsfilter, webrtc)
+    )
+    webrtcbin = webrtc  # Activate the WebRTC branch.
 
     print("[INFO] Pipeline created.")
     return pipeline
 
 # ----- WebRTC and Signaling Callbacks -----
-
 def on_negotiation_needed(element):
     print("[DEBUG] on-negotiation-needed called; initiating offer creation.")
     promise = Gst.Promise.new_with_change_func(on_offer_created, element, None)
@@ -280,17 +296,22 @@ async def handle_signaling():
         async for message in ws:
             print("[DEBUG] WebSocket message received.")
             data = json.loads(message)
+            print(data)
             if data.get("type") == "answer":
-                sdp_msg = GstSdp.SDPMessage.new()
-                res = GstSdp.sdp_message_parse_buffer(data["sdp"].encode(), sdp_msg)
-                if res != GstSdp.SDPResult.OK:
-                    print(f"[ERROR] Failed parsing answer SDP: result={res}")
-                    continue
+                sdp_result = GstSdp.SDPMessage.new_from_text(data["sdp"])
+                if isinstance(sdp_result, tuple):
+                    # Unpack the tuple; assume the second item is the SDPMessage
+                    _, sdp_msg = sdp_result
+                else:
+                    sdp_msg = sdp_result
+                # Now create the answer using the SDPMessage object
                 answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdp_msg)
                 main_loop.call_soon_threadsafe(lambda: webrtcbin.emit("set-remote-description", answer, None))
                 print("[INFO] Remote SDP answer applied.")
             elif data.get("type") == "ice":
-                main_loop.call_soon_threadsafe(lambda: webrtcbin.emit("add-ice-candidate", data["sdpMLineIndex"], data["candidate"]))
+                main_loop.call_soon_threadsafe(
+                    lambda: webrtcbin.emit("add-ice-candidate", data["sdpMLineIndex"], data["candidate"])
+                )
                 print(f"[INFO] Remote ICE candidate added: {data['candidate']}")
     except Exception as e:
         print(f"[ERROR] WebSocket signaling error: {e}")
@@ -298,6 +319,7 @@ async def handle_signaling():
         if ws:
             await ws.close()
             print("[INFO] WebSocket connection closed.")
+
 
 async def monitor_pipeline():
     while True:
@@ -320,7 +342,7 @@ async def main():
     main_loop = asyncio.get_event_loop()
     pipeline = create_pipeline()
 
-    # Connect WebRTC signals (if enabled later)
+    # Connect WebRTC signals.
     if webrtcbin:
         webrtcbin.connect("on-negotiation-needed", on_negotiation_needed)
         webrtcbin.connect("on-ice-candidate", on_ice_candidate)
@@ -338,11 +360,10 @@ async def main():
     print(f"[INFO] Pipeline state result: {ret.value_nick}")
     print(f"[INFO] Pipeline current state: {current.value_nick}, pending: {pending.value_nick}")
 
-    print("[INFO] Pipeline is running. Recording to file active.")
+    print("[INFO] Pipeline is running. Recording to file active and WebRTC branch enabled.")
     
-    # Start signaling (if needed later)
+    # Start signaling and monitoring tasks.
     asyncio.ensure_future(handle_signaling())
-
     asyncio.ensure_future(monitor_pipeline())
     asyncio.ensure_future(monitor_file_size("recorded_test.ts", interval=5))
 
