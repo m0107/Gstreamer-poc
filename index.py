@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 import json
 import websockets
@@ -30,18 +31,39 @@ pending_offer_sdp = None
 start_time = None  # For forced timestamping (if needed)
 
 #############################################
+# Debug Probe for Logging at a Pad
+#############################################
+def debug_probe(pad, info):
+    if info.type & Gst.PadProbeType.BUFFER:
+        buf = info.get_buffer()
+        if buf:
+            print(f"[DEBUG PROBE] Buffer reached {pad.get_name()} (size: {buf.get_size()} bytes)")
+    return Gst.PadProbeReturn.OK
+
+#############################################
+# RTP Probe Function (for Logging Only)
+#############################################
+def rtp_probe(pad, info):
+    # This probe is installed on the rtph264pay src pad (and optionally later on output pads)
+    if info.type & Gst.PadProbeType.BUFFER:
+        buf = info.get_buffer()
+        if buf:
+            print(f"[RTP PROBE] Buffer received on pad {pad.get_name()} (size: {buf.get_size()} bytes)")
+    return Gst.PadProbeReturn.OK
+
+#############################################
 # Keyframe Probe Function for Renegotiation #
 #############################################
 def keyframe_probe(pad, info):
     # This probe runs on h264parse_web's src pad.
-    # We trigger renegotiation when the first keyframe appears,
-    # i.e. a buffer that is NOT marked as a delta unit.
+    # When a keyframe (buffer not flagged as DELTA_UNIT) is detected, trigger renegotiation.
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
         if buf and not (buf.get_flags() & Gst.BufferFlags.DELTA_UNIT):
             print("[DEBUG] Keyframe detected, triggering renegotiation.")
             trigger_renegotiation_if_needed()
-            return Gst.PadProbeReturn.REMOVE  # Remove the probe after triggering.
+            # Return OK so that the probe remains (or REMOVE if you prefer one-time trigger)
+            return Gst.PadProbeReturn.OK
     return Gst.PadProbeReturn.OK
 
 #############################################
@@ -57,7 +79,7 @@ def trigger_renegotiation_if_needed():
     webrtcbin.emit("create-offer", None, promise)
 
 #############################################
-# Probes and Utility Functions              #
+# Utility and Logging Probes                #
 #############################################
 def force_timestamp_probe(pad, info):
     global start_time
@@ -77,17 +99,15 @@ def force_timestamp_probe(pad, info):
 def log_timestamp_probe(pad, info):
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
-        # Uncomment for detailed timestamp logging:
-        # if buf:
-        #     print(f"[TIMESTAMP LOG] PTS: {buf.pts}, DTS: {buf.dts}, Size: {buf.get_size()} bytes")
+        # Uncomment below to log detailed timestamps:
+        # print(f"[TIMESTAMP LOG] PTS: {buf.pts}, DTS: {buf.dts}, Size: {buf.get_size()} bytes")
     return Gst.PadProbeReturn.OK
 
 def log_probe(pad, info):
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
-        # Uncomment for detailed buffer logging:
-        # if buf:
-        #     print(f"[LOG PROBE] Buffer at {pad.get_name()}; size: {buf.get_size()} bytes, PTS: {buf.pts}")
+        # Uncomment below for additional buffer logging
+        # print(f"[LOG PROBE] Buffer at {pad.get_name()}; size: {buf.get_size()} bytes, PTS: {buf.pts}")
     return Gst.PadProbeReturn.OK
 
 def has_audio_stream(rtsp_url):
@@ -109,14 +129,13 @@ def check_elem(name, elem):
 def on_pad_added(src, new_pad, target_elem):
     """
     Link the dynamic pad from the RTSP source:
-      - If the pad's caps is "application/x-rtp", link it to the target element.
+      - If the pad’s caps is "application/x-rtp", link it to the target element.
       - Otherwise, link it to a fakesink.
     """
     print(f"[DEBUG] on_pad_added: Detected new pad {new_pad.get_name()} from {src.get_name()}")
     caps = new_pad.get_current_caps() or new_pad.query_caps(None)
     structure = caps.get_structure(0)
     pad_type = structure.get_name()
-
     if pad_type != "application/x-rtp":
         print(f"[DEBUG] Non-RTP pad detected ({pad_type}); linking {new_pad.get_name()} to a fakesink.")
         fakesink = Gst.ElementFactory.make("fakesink", f"fakesink_{uuid.uuid4().hex}")
@@ -132,8 +151,7 @@ def on_pad_added(src, new_pad, target_elem):
         else:
             print(f"[ERROR] Failed to link non-RTP pad {new_pad.get_name()} (error code: {ret}).")
         return
-
-    # For RTP pads, link it to the target element.
+    # For RTP pads, link to the target element.
     sink_pad = target_elem.get_static_pad("sink")
     if not sink_pad:
         print("[ERROR] Target element does not have a sink pad.")
@@ -141,29 +159,30 @@ def on_pad_added(src, new_pad, target_elem):
     if sink_pad.is_linked():
         print("[WARNING] Target sink pad already linked; ignoring new pad.")
         return
-
     ret = new_pad.link(sink_pad)
     if ret == Gst.PadLinkReturn.OK:
         print("[INFO] Successfully linked dynamic RTP pad to identity element.")
-        # We no longer use a fixed timer here; instead we use a probe on the transcoding branch.
     else:
         print(f"[ERROR] Failed to link dynamic pad {new_pad.get_name()} (error code: {ret}).")
 
 def link_many(*elements):
     for i in range(len(elements) - 1):
-        if not elements[i].link(elements[i + 1]):
-            print(f"[ERROR] Failed to link {elements[i].get_name()} -> {elements[i + 1].get_name()}")
+        if not elements[i].link(elements[i+1]):
+            print(f"[ERROR] Failed to link {elements[i].get_name()} -> {elements[i+1].get_name()}")
             return False
-        print(f"[DEBUG] Linked {elements[i].get_name()} -> {elements[i + 1].get_name()}")
+        print(f"[DEBUG] Linked {elements[i].get_name()} -> {elements[i+1].get_name()}")
     return True
 
 def link_webrtc_branch(pad, info, capsfilter, webrtc):
+    # This function is meant to be called during a CAPS event on a pad.
     if info.get_event().type == Gst.EventType.CAPS:
         print("[DEBUG] CAPS detected in WebRTC branch; linking payloader to webrtcbin...")
+        # Add an RTP probe so that buffers are continuously logged on this pad.
+        pad.add_probe(Gst.PadProbeType.BUFFER, rtp_probe)
         pad.link(capsfilter.get_static_pad("sink"))
         capsfilter.get_static_pad("src").link(webrtc.get_request_pad("sink_%u"))
         print("[INFO] Linked RTP payloader -> capsfilter -> webrtcbin")
-        return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
     return Gst.PadProbeReturn.OK
 
 #############################################
@@ -180,11 +199,12 @@ def create_pipeline():
     src = check_elem("rtspsrc", Gst.ElementFactory.make("rtspsrc", "src"))
     src.set_property("location", CAMERA_URL)
     src.set_property("latency", 300)
-    
+    src.set_property("protocols", "tcp")  # Force TCP for stability
+
     identity_timestamp = check_elem("identity", Gst.ElementFactory.make("identity", "identity_timestamp"))
     pipeline.add(identity_timestamp)
     src.connect("pad-added", on_pad_added, identity_timestamp)
-    # Optionally, force timestamping:
+    # Optionally, add a probe for timestamp forcing:
     # identity_timestamp.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, force_timestamp_probe)
 
     # Process H265 from the camera (common branch).
@@ -192,7 +212,7 @@ def create_pipeline():
     h265parse = check_elem("h265parse", Gst.ElementFactory.make("h265parse", "h265parse"))
     h265parse.set_property("config-interval", 2)
     tee = check_elem("tee", Gst.ElementFactory.make("tee", "tee"))
-
+    
     # --- Recording Branch (H265) ---
     queue_rec = check_elem("queue", Gst.ElementFactory.make("queue", "queue_record"))
     queue_rec.set_property("max-size-buffers", 300)
@@ -229,6 +249,8 @@ def create_pipeline():
     caps_text = "application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96"
     caps = Gst.Caps.from_string(caps_text)
     capsfilter.set_property("caps", caps)
+    # Add a debug probe to log buffers arriving at the capsfilter sink continuously.
+    capsfilter.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, debug_probe)
     
     webrtc = check_elem("webrtcbin", Gst.ElementFactory.make("webrtcbin", "webrtcbin"))
     webrtc.set_property("stun-server", "stun://stun.l.google.com:19302")
@@ -262,20 +284,29 @@ def create_pipeline():
         raise RuntimeError("[FATAL] Failed to link mux to filesink.")
 
     # WebRTC branch: tee -> queue_webrtc -> decoder -> encoder -> h264parse_web -> pay -> capsfilter -> webrtcbin.
-    if not link_many(tee, queue_webrtc, decoder, encoder, h264parse_web, pay, capsfilter, webrtc):
-        raise RuntimeError("[FATAL] Failed to link WebRTC branch: tee -> queue_webrtc -> decoder -> encoder -> h264parse_web -> pay -> capsfilter -> webrtcbin")
-    
-    # Install a pad probe on h264parse_web's source pad to trigger renegotiation once a keyframe is detected.
-    h264parse_web.get_static_pad("src").add_probe(
-        Gst.PadProbeType.BUFFER, keyframe_probe
-    )
+    tee_webrtc_pad = tee.get_request_pad("src_%u")
+    if tee_webrtc_pad is None:
+        raise RuntimeError("[FATAL] Failed to get request pad from tee for WebRTC branch.")
+    if tee_webrtc_pad.link(queue_webrtc.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+        raise RuntimeError("[FATAL] Failed to link tee to webrtc queue.")
+    if not link_many(queue_webrtc, decoder, encoder, h264parse_web, pay):
+        raise RuntimeError("[FATAL] Failed to link WebRTC branch (queue_webrtc -> decoder -> encoder -> h264parse_web -> pay)")
+    # Add an RTP probe on the payloader's src pad to log RTP buffers continuously.
+    pay.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, rtp_probe)
+    # Now link the remainder of the WebRTC branch.
+    if not link_many(pay, capsfilter, webrtc):
+        raise RuntimeError("[FATAL] Failed to link pay -> capsfilter -> webrtcbin")
+    # Install a pad probe on h264parse_web's src pad to trigger renegotiation upon keyframe detection.
+    h264parse_web.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, keyframe_probe)
     
     # Activate the WebRTC branch.
     webrtcbin = webrtc
     print("[INFO] Pipeline created.")
     return pipeline
 
-# ----- WebRTC and Signaling Callbacks -----
+#############################################
+# WebRTC and Signaling Callbacks
+#############################################
 def on_negotiation_needed(element):
     print("[DEBUG] on-negotiation-needed called; initiating offer creation.")
     promise = Gst.Promise.new_with_change_func(on_offer_created, element, None)
@@ -363,69 +394,37 @@ async def monitor_file_size(filepath, interval=5):
             print(f"[FILE MONITOR] Error checking file size: {e}")
         await asyncio.sleep(interval)
 
+#############################################
+# Main Function
+#############################################
 async def main():
-    global pipeline, webrtcbin, main_loop
-    print("[INFO] Application initializing...")
-    main_loop = asyncio.get_event_loop()
-    pipeline = create_pipeline()
+    global pipeline, main_loop
+    Gst.init(None)
+    main_loop = asyncio.get_running_loop()
 
-    # Connect WebRTC signals.
-    if webrtcbin:
+    try:
+        pipeline = create_pipeline()
+        
+        # Connect WebRTC signals.
         webrtcbin.connect("on-negotiation-needed", on_negotiation_needed)
         webrtcbin.connect("on-ice-candidate", on_ice_candidate)
 
-    print("[DEBUG] Setting pipeline to PLAYING state...")
-    state_ret = pipeline.set_state(Gst.State.PLAYING)
-    if state_ret == Gst.StateChangeReturn.FAILURE:
-        raise RuntimeError("[FATAL] Failed to set pipeline to PLAYING state.")
-    elif state_ret == Gst.StateChangeReturn.ASYNC:
-        print("[INFO] Pipeline state change is asynchronous.")
-    else:
-        print(f"[INFO] Pipeline state change: {state_ret}")
+        pipeline.set_state(Gst.State.PLAYING)
+        print("[INFO] Pipeline started.")
 
-    ret, current, pending = pipeline.get_state(Gst.SECOND * 5)
-    print(f"[INFO] Pipeline state result: {ret.value_nick}")
-    print(f"[INFO] Pipeline current state: {current.value_nick}, pending: {pending.value_nick}")
+        # Start monitoring tasks.
+        signaling_task = asyncio.create_task(handle_signaling())
+        pipeline_monitor_task = asyncio.create_task(monitor_pipeline())
+        file_monitor_task = asyncio.create_task(monitor_file_size("recorded_test.ts"))
 
-    print("[INFO] Pipeline is running. Recording to file active and WebRTC branch enabled.")
-    
-    # Start signaling and monitoring tasks.
-    asyncio.ensure_future(handle_signaling())
-    asyncio.ensure_future(monitor_pipeline())
-    asyncio.ensure_future(monitor_file_size("recorded_test.ts", interval=60))
+        await asyncio.gather(signaling_task, pipeline_monitor_task, file_monitor_task)
 
-    bus = pipeline.get_bus()
-    bus.add_signal_watch()
-
-    def on_bus_message(_, msg):
-        try:
-            if msg.type == Gst.MessageType.ERROR:
-                err, debug = msg.parse_error()
-                print(f"[ERROR] GStreamer pipeline error: {err}, debug info: {debug}")
-                asyncio.get_event_loop().stop()
-            elif msg.type == Gst.MessageType.EOS:
-                print("[INFO] GStreamer EOS received. Pipeline will shut down.")
-                asyncio.get_event_loop().stop()
-            elif msg.type == Gst.MessageType.STATE_CHANGED:
-                if msg.src == pipeline:
-                    old, new, pending = msg.parse_state_changed()
-                    print(f"[DEBUG] Pipeline state changed: {old.value_nick} → {new.value_nick} (pending: {pending.value_nick})")
-        except Exception as e:
-            print(f"[EXCEPTION] Error in on_bus_message: {e}")
-
-    bus.connect("message", on_bus_message)
-
-    await asyncio.Future()  # Keeps the loop running
-
-if __name__ == "__main__":
-    Gst.init(None)
-    print("[INFO] GStreamer and gbulb initialized.")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("[INFO] Shutdown signal received. Cleaning up...")
+    except Exception as e:
+        print(f"[FATAL] An error occurred: {e}")
     finally:
         if pipeline:
             pipeline.set_state(Gst.State.NULL)
-            print("[INFO] Pipeline stopped and cleaned up.")
-        print("[INFO] Application terminated.")
+            print("[INFO] Pipeline stopped.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
