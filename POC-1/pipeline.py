@@ -2,6 +2,10 @@
 import uuid
 import threading
 import logging
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GObject", "2.0")
 from gi.repository import Gst, GObject
 
 # Initialize GStreamer
@@ -20,22 +24,21 @@ class StreamPipeline:
     def _build_pipeline(self) -> Gst.Pipeline:
         """
         Builds a live pipeline that:
-          - Reads H264 from RTSP
+          - Reads H.265 from RTSP
           - Splits into two branches:
               * Records to an MPEG-TS file
-              * Streams over WebRTC via webrtcbin
+              * Streams over WebRTC via VP8 encoding
         """
         launch = (
             f"rtspsrc location={self.rtsp} protocols=tcp latency=200 name=src "
-            # Depayload the incoming RTP H264 into raw H264 bytestream
-            "src. ! rtph264depay name=depay "
-            # Split into two branches
-            "depay. ! tee name=t "
-            # Branch 1: recording
-            f"t. ! queue ! h264parse ! mpegtsmux ! filesink location=record_{self.id}.ts sync=false "
-            # Branch 2: WebRTC
-            f"t. ! queue ! h264parse ! rtph264pay pt=96 config-interval=1 ! "
-            "application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96 ! "
+            # Depayload H.265
+            "src. ! rtph265depay ! h265parse ! decodebin ! videoconvert ! tee name=t "
+            # Branch 1: record H.265
+            f"t. ! queue ! x265enc tune=zerolatency bitrate=1024 key-int-max=30 "
+            "! h265parse ! mpegtsmux ! filesink location=record_{self.id}.ts sync=false "
+            # Branch 2: re-encode to VP8 for WebRTC
+            "t. ! queue ! vp8enc deadline=1 ! rtpvp8pay pt=96 ! "
+            "application/x-rtp,media=video,clock-rate=90000,encoding-name=VP8,payload=96 ! "
             f"webrtcbin name=webrtc stun-server={self.stun}"
         )
         logger.debug(f"Launching pipeline: {launch}")
@@ -49,7 +52,7 @@ class StreamPipeline:
         logger.info(f"Stream {self.id} started.")
 
     def _run_loop(self):
-        GObject.threads_init()
+        # Run the GLib main loop to handle GStreamer messages
         self.loop.run()
 
     def stop(self):
@@ -57,3 +60,15 @@ class StreamPipeline:
         self.pipeline.set_state(Gst.State.NULL)
         self.loop.quit()
         logger.info(f"Stream {self.id} stopped.")
+
+
+if __name__ == "__main__":
+    # quick local smoke test
+    import time
+    logging.basicConfig(level=logging.INFO)
+    TEST_RTSP = "rtsp://admin:Password@10.0.0.9:554/Streaming/Channels/101"
+    sp = StreamPipeline(TEST_RTSP, "stun://stun.l.google.com:19302")
+    sp.start()
+    time.sleep(8)
+    sp.stop()
+    print(f"Recorded to record_{sp.id}.ts")

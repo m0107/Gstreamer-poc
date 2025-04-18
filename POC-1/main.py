@@ -1,4 +1,7 @@
-import os, logging
+# main.py
+
+import os
+import logging
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -19,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-active_streams = {}  # stream_id: { pipeline: StreamPipeline, ws: WebSocket }
+active_streams = {}  # stream_id → { pipeline: StreamPipeline, ws: WebSocket }
 
 @app.get("/cameras")
 def list_cameras():
@@ -74,7 +77,6 @@ async def signaling(ws: WebSocket, stream_id: str):
     try:
         while True:
             msg = await ws.receive_text()
-            # parse and feed remote SDP/ICE
             if msg.startswith("v=0"):  # SDP
                 from gi.repository import GstSdp, GstWebRTC
                 _, sdp = GstSdp.SDPMessage.new_from_text(msg)
@@ -82,7 +84,7 @@ async def signaling(ws: WebSocket, stream_id: str):
                     GstWebRTC.WebRTCSDPType.ANSWER, sdp)
                 webrtc.emit("set-remote-description", answer, None)
             elif msg.startswith("ICE:"):
-                _, mline, cand = msg.split(':', 2)
+                _, mline, cand = msg.split(":", 2)
                 webrtc.emit("add-ice-candidate", int(mline), cand)
     except WebSocketDisconnect:
         info["pipeline"].stop()

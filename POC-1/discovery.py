@@ -13,6 +13,7 @@ PASS = os.getenv("ONVIF_PASSWORD")
 
 logger = logging.getLogger(__name__)
 
+
 def discover_onvif(timeout: int = 5):
     """
     Discover ONVIF devices via WS-Discovery.
@@ -30,21 +31,16 @@ def discover_onvif(timeout: int = 5):
     wsd.stop()
     return cams
 
+
 def get_rtsp_uri(service_url: str) -> str:
     """
     Get RTSP URI from ONVIF Media Service.
 
-    Requires a local 'wsdl/' folder with ONVIF WSDL files. To set this up:
+    Requires a local 'wsdl/' folder next to this file containing the ONVIF WSDLs:
       git clone https://github.com/FalkTannhaeuser/python-onvif-zeep.git onvif-zeep
       cp -R onvif-zeep/wsdl ./wsdl
       rm -rf onvif-zeep
-
-    The 'wsdl/' directory should be in the same folder as this file.
     """
-    # Parse host and port
-
-  
-
     p = urlparse(service_url)
     wsdl_dir = os.path.join(os.path.dirname(__file__), 'wsdl')
     if not os.path.isdir(wsdl_dir):
@@ -53,8 +49,8 @@ def get_rtsp_uri(service_url: str) -> str:
     cam = ONVIFCamera(
         p.hostname,
         p.port or 80,
-        "mohit",
-        "Password",
+        USER,
+        PASS,
         wsdl_dir,
         service_url
     )
@@ -73,5 +69,15 @@ def get_rtsp_uri(service_url: str) -> str:
     logger.info(f"RTSP URI for {p.hostname}: {uri}")
     return uri
 
-service_url =  "http://10.0.0.9/onvif/device_service" 
-get_rtsp_uri(service_url)
+
+if __name__ == "__main__":
+    import pprint
+    logging.basicConfig(level=logging.INFO)
+    cams = discover_onvif(timeout=5)
+    print("Discovered ONVIF cameras:")
+    pprint.pprint(cams)
+    if cams:
+        rtsp = get_rtsp_uri(cams[0]["service_url"])
+        print("\n→ RTSP URI for first camera:\n", rtsp)
+    else:
+        print("No cameras found.")
