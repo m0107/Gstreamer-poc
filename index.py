@@ -20,7 +20,7 @@ gbulb.install()
 
 # Settings
 SIGNALING_SERVER = "ws://localhost:8765"
-CAMERA_URL = "rtsp://admin:Password@192.168.0.201:554/Streaming/channels/101"
+CAMERA_URL = "rtsp://admin:Password@10.0.0.9:554/Streaming/channels/101"
 
 # Globals
 pipeline = None
@@ -294,8 +294,17 @@ def create_pipeline():
     # Add an RTP probe on the payloader's src pad to log RTP buffers continuously.
     pay.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, rtp_probe)
     # Now link the remainder of the WebRTC branch.
-    if not link_many(pay, capsfilter, webrtc):
-        raise RuntimeError("[FATAL] Failed to link pay -> capsfilter -> webrtcbin")
+    # 1) pay → capsfilter
+    if not link_many(pay, capsfilter):
+        raise RuntimeError("[FATAL] Failed to link pay → capsfilter")
+    # 2) request webrtcbin sink pad
+    webrtc_sink = webrtc.get_request_pad("sink_%u")
+    if not webrtc_sink:
+        raise RuntimeError("[FATAL] Could not get request pad from webrtcbin")
+    # 3) capsfilter → webrtcbin
+    caps_src = capsfilter.get_static_pad("src")
+    if caps_src.link(webrtc_sink) != Gst.PadLinkReturn.OK:
+        raise RuntimeError("[FATAL] Failed to link capsfilter → webrtcbin request pad")
     # Install a pad probe on h264parse_web's src pad to trigger renegotiation upon keyframe detection.
     h264parse_web.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, keyframe_probe)
     
