@@ -20,7 +20,7 @@ gbulb.install()
 
 # Settings
 SIGNALING_SERVER = "ws://localhost:8765"
-CAMERA_URL = "rtsp://admin:Password@10.0.0.9:554/Streaming/channels/101"
+CAMERA_URL = "rtsp://admin:Password@10.0.0.4:554/Streaming/Channels/101"
 
 # Globals
 pipeline = None
@@ -28,6 +28,7 @@ webrtcbin = None
 ws = None
 main_loop = None
 pending_offer_sdp = None
+initial_mid = None  # Store initial media ID
 start_time = None  # For forced timestamping (if needed)
 
 #############################################
@@ -36,8 +37,8 @@ start_time = None  # For forced timestamping (if needed)
 def debug_probe(pad, info):
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
-        if buf:
-            print(f"[DEBUG PROBE] Buffer reached {pad.get_name()} (size: {buf.get_size()} bytes)")
+        # if buf:
+        #     print(f"[DEBUG PROBE] Buffer reached {pad.get_name()} (size: {buf.get_size()} bytes)")
     return Gst.PadProbeReturn.OK
 
 #############################################
@@ -47,8 +48,8 @@ def rtp_probe(pad, info):
     # This probe is installed on the rtph264pay src pad (and optionally later on output pads)
     if info.type & Gst.PadProbeType.BUFFER:
         buf = info.get_buffer()
-        if buf:
-            print(f"[RTP PROBE] Buffer received on pad {pad.get_name()} (size: {buf.get_size()} bytes)")
+        # if buf:
+        #     print(f"[RTP PROBE] Buffer received on pad {pad.get_name()} (size: {buf.get_size()} bytes)")
     return Gst.PadProbeReturn.OK
 
 #############################################
@@ -199,7 +200,7 @@ def create_pipeline():
     src = check_elem("rtspsrc", Gst.ElementFactory.make("rtspsrc", "src"))
     src.set_property("location", CAMERA_URL)
     src.set_property("latency", 300)
-    src.set_property("protocols", "tcp")  # Force TCP for stability
+    src.set_property("protocols", "udp")  # Force TCP for stability
 
     identity_timestamp = check_elem("identity", Gst.ElementFactory.make("identity", "identity_timestamp"))
     pipeline.add(identity_timestamp)
@@ -254,6 +255,11 @@ def create_pipeline():
     
     webrtc = check_elem("webrtcbin", Gst.ElementFactory.make("webrtcbin", "webrtcbin"))
     webrtc.set_property("stun-server", "stun://stun.l.google.com:19302")
+    # now add your TURN server
+    webrtc.emit(
+        "add-turn-server",
+        "turn://USERNAME:PASSWORD@your.turn.host:3478?transport=udp"
+    )
 
     # Add all elements to the pipeline.
     for elem in (src, identity_timestamp, depay, h265parse, tee, queue_rec,
@@ -322,11 +328,33 @@ def on_negotiation_needed(element):
     element.emit("create-offer", None, promise)
 
 def on_offer_created(promise, _, __):
-    global webrtcbin, ws, pending_offer_sdp
+    global webrtcbin, ws, pending_offer_sdp, initial_mid
     reply = promise.get_reply()
     offer = reply.get_value("offer")
     webrtcbin.emit("set-local-description", offer, None)
     sdp_text = offer.sdp.as_text()
+
+    if initial_mid is None:
+        for line in sdp_text.splitlines():
+            if line.startswith("a=mid:"):
+                initial_mid = line.split(":")[1]
+                print(f"[DEBUG] Storing initial a=mid: {initial_mid}")
+                break
+
+    # Modify SDP to keep MID consistent
+    if initial_mid is not None:
+        new_sdp_text = ""
+        for line in sdp_text.splitlines():
+            if line.startswith("a=mid:"):
+                new_sdp_text += f"a=mid:{initial_mid}\r\n"  # Keep the original MID
+            else:
+                new_sdp_text += line + "\r\n"
+        sdp_text = new_sdp_text
+        print("[DEBUG] Modified SDP to keep a=mid consistent.")
+    else:
+        print("[WARN] Initial a=mid not found. Cannot modify SDP.")
+
+
     print("[DEBUG] Local SDP offer (after renegotiation):")
     print(sdp_text)
     print("[DEBUG] Preparing to send offer over WebSocket...")

@@ -1,10 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
-  <title>GStreamer WebRTC Client</title>
+  <title>GStreamer WebRTC Client (Advanced + Blob Fix)</title>
   <style>
-    body { font-family: sans-serif; }
+    body {
+      font-family: sans-serif;
+    }
+
     #remoteVideo {
       width: 640px;
       height: 360px;
@@ -12,8 +16,9 @@
     }
   </style>
 </head>
+
 <body>
-  <h1>GStreamer WebRTC Test</h1>
+  <h1>GStreamer WebRTC Test (Perfect Negotiation + m‑line fix + Blob handling)</h1>
   <video id="remoteVideo" autoplay playsinline controls></video>
   <div>
     <button id="startBtn">Start WebSocket</button>
@@ -21,167 +26,201 @@
   </div>
 
   <script>
-    const signalingUrl = "ws://localhost:8765"; // signaling server URL
-    let pc = null;         // RTCPeerConnection
-    let ws = null;         // WebSocket
-    let remoteVideo;       // HTMLVideoElement for showing stream
-    let statusElem;        // Paragraph element for status messages
-    let lastOfferSdp = ""; // Store last offer to avoid duplicate processing
+    const SIGNALING_URL = "ws://localhost:8765";
+    const polite = true;            // this side yields on collision
+    let pc;                         // RTCPeerConnection
+    let ws;                         // WebSocket
+    let makingOffer = false;        // are we in the process of creating an offer?
+    let ignoreOffer = false;        // should we drop an incoming offer?
+    let remoteVideo, statusElem;
 
     window.onload = () => {
-      console.log("[CLIENT] Window loaded.");
       remoteVideo = document.getElementById("remoteVideo");
       statusElem = document.getElementById("status");
-      document.getElementById("startBtn").onclick = startWebSocket;
+      document.getElementById("startBtn").onclick = startSignaling;
     };
 
-    function logStatus(message) {
-      console.log("[STATUS]", message);
-      if (statusElem) {
-        statusElem.innerText = message;
-      }
+    function log(msg) {
+      console.log("[STATUS]", msg);
+      statusElem.textContent = msg;
     }
 
-    function startWebSocket() {
-      logStatus("Connecting to signaling server...");
-      ws = new WebSocket(signalingUrl);
+    function startSignaling() {
+      log("Connecting to signaling server…");
+      ws = new WebSocket(SIGNALING_URL);
 
       ws.onopen = () => {
-        logStatus("WebSocket connected. Waiting for offer...");
-        console.log("[WS] Connection established");
+        log("WebSocket open. Creating PeerConnection…");
+        createPeerConnection();
       };
 
       ws.onmessage = async (evt) => {
+        // —— Blob‑to‑text logic ——
         let dataText;
         if (evt.data instanceof Blob) {
           dataText = await evt.data.text();
-          console.log("[WS] Received Blob message, converted to text.");
+          console.log("[WS] Received Blob → text");
         } else {
           dataText = evt.data;
         }
+
         console.log("[WS] Raw message:", dataText);
         let msg;
         try {
           msg = JSON.parse(dataText);
-          console.log("[WS] Parsed message:", msg);
         } catch (e) {
-          console.error("[WS] Failed to parse message:", e);
+          console.error("[WS] Failed to parse JSON:", e, dataText);
           return;
         }
 
-        // Handle SDP offer from the server
-        if (msg.type === "offer") {
-          if (pc && pc.signalingState !== "stable") {
-            console.warn("[WS] Offer received but connection is already negotiating. Ignoring duplicate offer.");
-            return;
-          }
-          if (msg.sdp === lastOfferSdp) {
-            console.warn("[WS] Duplicate offer received. Ignoring.");
-            return;
-          }
-          lastOfferSdp = msg.sdp;
-          logStatus("Received offer from server (GStreamer).");
-          console.log("[WS] Creating new RTCPeerConnection");
-          if (pc) {
-            pc.close();
-            console.log("[WS] Closed existing connection.");
-          }
-          createPeerConnection();
+        // ———— SDP offer/answer handling ————
+        if (msg.type === "offer" || msg.type === "answer") {
+          const desc = new RTCSessionDescription(msg);
+          const isOffer = msg.type === "offer";
+          const collision = isOffer &&
+            (makingOffer || (pc && pc.signalingState !== "stable"));
 
-          const offerDesc = new RTCSessionDescription({
-            type: "offer",
-            sdp: msg.sdp
-          });
+          ignoreOffer = !polite && collision;
+          if (ignoreOffer) {
+            console.warn("[WS] Collision – ignoring incoming offer");
+            return;
+          }
 
           try {
-            console.log("[WS] Setting remote description with offer...");
-            await pc.setRemoteDescription(offerDesc);
-            logStatus("Remote description set. Creating answer...");
-            console.log("[WS] Creating answer...");
-            const answer = await pc.createAnswer();
-            console.log("[WS] Answer created:", answer.sdp);
-            await pc.setLocalDescription(answer);
-            console.log("[WS] Local description set.");
-            const answerMsg = {
-              type: "answer",
-              sdp: answer.sdp
-            };
-            ws.send(JSON.stringify(answerMsg));
-            logStatus("Sent answer back to server.");
-          } catch (error) {
-            console.error("[WS] Error during SDP negotiation:", error);
-            logStatus("SDP negotiation error.");
+            log(`${msg.type.toUpperCase()} received; setting remote description…`);
+            if (!pc) {
+              console.log("[WS] Creating new RTCPeerConnection (inside offer)");
+              createPeerConnection();
+            }
+            await pc.setRemoteDescription(desc);
+
+            if (isOffer) {
+              log("Creating ANSWER…");
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify(pc.localDescription));
+              log("ANSWER sent.");
+            }
+          } catch (err) {
+            console.error("[WS] SDP negotiation failed:", err);
+
+            // **m‑line order mismatch:** rebuild
+            if (err.message.includes("order of m-lines")) {
+              console.warn("[WS] m‑line mismatch → recreating PeerConnection");
+              cleanupPeerConnection();
+              createPeerConnection();
+
+              // retry the exchange
+              try {
+                await pc.setRemoteDescription(desc);
+                if (isOffer) {
+                  const answer2 = await pc.createAnswer();
+                  await pc.setLocalDescription(answer2);
+                  ws.send(JSON.stringify(pc.localDescription));
+                  log("Re‑sent ANSWER after reset.");
+                }
+              } catch (err2) {
+                console.error("[WS] Retry negotiation failed:", err2);
+              }
+            }
           }
         }
-        // Handle ICE candidate messages from the server
+
+        // ———— ICE candidate handling ————
         else if (msg.type === "ice") {
-          console.log("[WS] Received ICE candidate from server:", msg);
           try {
-            const candidate = new RTCIceCandidate({
-              sdpMid: msg.sdpMid,
-              sdpMLineIndex: msg.sdpMLineIndex,
-              candidate: msg.candidate
-            });
-            await pc.addIceCandidate(candidate);
-            console.log("[WS] Added remote ICE candidate:", candidate);
-          } catch (err) {
-            console.warn("[WS] Error adding remote ICE candidate:", err);
+            await pc.addIceCandidate(msg.candidate);
+            console.log("[WS] Remote ICE added.");
+          } catch (e) {
+            console.warn("[WS] Failed to add remote ICE:", e);
           }
         }
       };
 
       ws.onclose = () => {
-        logStatus("WebSocket closed.");
-        console.log("[WS] Connection closed");
+        log("WebSocket closed.");
+        cleanupPeerConnection();
       };
-
-      ws.onerror = (err) => {
-        console.error("[WS] WebSocket error:", err);
+      ws.onerror = (e) => {
+        console.error("[WS] WebSocket error:", e);
+        cleanupPeerConnection();
       };
     }
 
     function createPeerConnection() {
       const config = {
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          {
+            urls: "turn:your.turn.host:3478?transport=udp",
+            username: "USERNAME",
+            credential: "PASSWORD"
+          }
+        ],
+        bundlePolicy: "balanced",
+        rtcpMuxPolicy: "require",
+        iceCandidatePoolSize: 1
       };
       pc = new RTCPeerConnection(config);
-      console.log("[WS] RTCPeerConnection created.");
+      log("PeerConnection created.");
 
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          const msg = {
-            type: "ice",
-            sdpMLineIndex: event.candidate.sdpMLineIndex,
-            candidate: event.candidate.candidate,
-          };
-          ws.send(JSON.stringify(msg));
-          console.log("[WS] Sent ICE candidate to server:", msg);
+      // Perfect‐negotiation: only create an offer when needed
+      pc.onnegotiationneeded = async () => {
+        try {
+          makingOffer = true;
+          log("Negotiation needed → creating OFFER…");
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          ws.send(JSON.stringify(pc.localDescription));
+          log("OFFER sent.");
+        } catch (err) {
+          console.error("[WS] Failed to create/send offer:", err);
+        } finally {
+          makingOffer = false;
         }
       };
 
-      pc.ontrack = (event) => {
-        console.log("[WS] Received remote track:", event.streams[0]);
-        remoteVideo.srcObject = event.streams[0];
-        remoteVideo.play().catch((err) => console.warn("[WS] Video play error:", err));
-        logStatus("Connected and streaming.");
-        // Log stats every 10 seconds.
-        setInterval(() => {
-            if (pc) {
-              pc.getStats(null).then(stats => {
-                stats.forEach(report => {
-                  console.log("Stats report:", report);
-                });
-              }).catch(e => {
-                console.error("Error getting stats:", e);
-              });
-            }
-          }, 10000); // every 10,000 milliseconds (10 seconds)
-      };
+      // send ICE
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate) {
+          ws.send(JSON.stringify({
+            type: "ice",
+            sdpMid: candidate.sdpMid,
+            sdpMLineIndex: candidate.sdpMLineIndex,
+            candidate: candidate.candidate
+          }));
+        console.log("[WS] Local ICE sent.");
+      }
+    };
 
-      pc.onconnectionstatechange = () => {
-        console.log("[WS] Connection state changed to:", pc.connectionState);
-      };
+    // display remote
+    pc.ontrack = ({ streams }) => {
+      console.log("[WS] Remote track arrived.");
+      remoteVideo.srcObject = streams[0];
+      remoteVideo.play().catch(e => console.warn("[WS] Video play error:", e));
+      log("Connected & streaming.");
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log("[WS] Connection state:", pc.connectionState);
+      if (pc.connectionState === "failed") {
+        log("ICE failed; restarting ICE.");
+        pc.restartIce();
+      }
+    };
+        }
+
+    function cleanupPeerConnection() {
+      if (!pc) return;
+      pc.onnegotiationneeded = null;
+      pc.onicecandidate = null;
+      pc.ontrack = null;
+      pc.onconnectionstatechange = null;
+      pc.close();
+      pc = null;
+      log("PeerConnection closed.");
     }
   </script>
 </body>
+
 </html>

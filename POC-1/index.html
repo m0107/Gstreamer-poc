@@ -1,24 +1,57 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <title>ONVIF Streamer Dashboard</title>
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    #controls { margin-bottom: 20px; }
-    select, button { padding: 5px 10px; margin-right: 10px; }
-    .stream { margin-bottom: 20px; }
-    video { border: 1px solid #ccc; width: 480px; height: 360px; background: #000; }
-    .stream-header { display: flex; align-items: center; margin-bottom: 5px; }
-    .stream-header span { margin-right: 10px; font-weight: bold; }
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+    }
+
+    #controls {
+      margin-bottom: 20px;
+    }
+
+    select,
+    button {
+      padding: 5px 10px;
+      margin-right: 10px;
+    }
+
+    .stream {
+      margin-bottom: 20px;
+    }
+
+    video {
+      border: 1px solid #ccc;
+      width: 480px;
+      height: 360px;
+      background: #000;
+    }
+
+    .stream-header {
+      display: flex;
+      align-items: center;
+      margin-bottom: 5px;
+    }
+
+    .stream-header span {
+      margin-right: 10px;
+      font-weight: bold;
+    }
   </style>
 </head>
+
 <body>
 
   <h1>ONVIF Streamer Dashboard</h1>
   <div id="controls">
     <label for="cameraSelect">Choose camera:</label>
-    <select id="cameraSelect"><option>Loading...</option></select>
+    <select id="cameraSelect">
+      <option>Loading...</option>
+    </select>
     <button id="refreshBtn">Refresh Cameras</button>
     <button id="startBtn">Start Stream</button>
   </div>
@@ -26,30 +59,33 @@
   <div id="streamsContainer"></div>
 
   <script>
-    // 🚨 Make sure this matches your FastAPI host & port:
     const apiBase = 'http://localhost:8000';
 
     let cameras = [];
     const streams = {};  // stream_id → { pc, ws, containerEl }
 
     async function loadCameras() {
-      console.log('[UI] loadCameras()');
+      console.info('[UI] loadCameras()');
       const sel = document.getElementById('cameraSelect');
       sel.disabled = true;
       sel.innerHTML = '<option>Loading...</option>';
 
       try {
         const resp = await fetch(`${apiBase}/cameras`);
-        console.log('[UI] fetch /cameras →', resp.status);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        console.info('[UI] GET /cameras →', resp.status);
+        if (!resp.ok) {
+          console.warn('[UI] loadCameras HTTP error', resp.status);
+          throw new Error(`HTTP ${resp.status}`);
+        }
         cameras = await resp.json();
-        console.log('[UI] cameras =', cameras);
+        console.debug('[UI] cameras =', cameras);
 
         if (cameras.length) {
-          sel.innerHTML = cameras.map((c,i) =>
-            `<option value="${i}">${c.service_url.replace(/^https?:\/\//,'')}</option>`
+          sel.innerHTML = cameras.map((c, i) =>
+            `<option value="${i}">${c.service_url.replace(/^https?:\/\//, '')}</option>`
           ).join('');
         } else {
+          console.warn('[UI] No cameras found');
           sel.innerHTML = '<option disabled>No cameras found</option>';
         }
       } catch (err) {
@@ -61,24 +97,29 @@
     }
 
     async function startStream() {
-      console.log('[UI] startStream()');
+      console.info('[UI] startStream()');
       const idx = document.getElementById('cameraSelect').value;
       if (cameras.length === 0 || idx === '') {
+        console.warn('[UI] No camera selected');
         alert('No camera selected');
         return;
       }
       const service_url = cameras[idx].service_url;
 
       try {
+        console.info('[UI] POST /streams payload:', { service_url });
         const resp = await fetch(`${apiBase}/streams`, {
           method: 'POST',
-          headers: {'Content-Type':'application/json'},
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ service_url })
         });
-        console.log('[UI] fetch /streams POST →', resp.status);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        console.info('[UI] POST /streams →', resp.status);
+        if (!resp.ok) {
+          console.error('[UI] startStream HTTP error', resp.status);
+          throw new Error(`HTTP ${resp.status}`);
+        }
         const { stream_id } = await resp.json();
-        console.log('[UI] started stream_id=', stream_id);
+        console.debug('[UI] started stream_id=', stream_id);
         setupStreamUI(stream_id, service_url);
       } catch (err) {
         console.error('[UI] startStream error:', err);
@@ -87,7 +128,7 @@
     }
 
     function setupStreamUI(stream_id, service_url) {
-      console.log('[UI] setupStreamUI(', stream_id, ')');
+      console.info(`[UI] setupStreamUI(${stream_id})`);
       const container = document.createElement('div');
       container.className = 'stream';
       container.id = `stream-${stream_id}`;
@@ -100,16 +141,26 @@
       `;
       document.getElementById('streamsContainer').append(container);
 
-      document.getElementById(`stop-${stream_id}`)
-        .onclick = () => stopStream(stream_id);
+      document.getElementById(`stop-${stream_id}`).onclick = () => stopStream(stream_id);
 
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          {
+            urls: "turn:your.turn.host:3478?transport=udp",
+            username: "USERNAME",
+            credential: "PASSWORD"
+          }
+        ],
+        iceTransportPolicy: "all",
+        bundlePolicy: "balanced",
+        rtcpMuxPolicy: "require",
+        iceCandidatePoolSize: 0
       });
       pc.onicecandidate = e => {
         if (e.candidate) {
-          console.log(`[UI][${stream_id}] ICE candidate →`, e.candidate);
-          ws.send(JSON.stringify({
+          console.debug(`[UI][${stream_id}] ICE candidate →`, e.candidate);
+          streams[stream_id].ws.send(JSON.stringify({
             type: 'ice',
             sdpMLineIndex: e.candidate.sdpMLineIndex,
             candidate: e.candidate.candidate
@@ -117,45 +168,54 @@
         }
       };
       pc.ontrack = e => {
-        console.log(`[UI][${stream_id}] ontrack →`, e.streams);
+        console.info(`[UI][${stream_id}] ontrack received`, e.streams);
         document.getElementById(`video-${stream_id}`).srcObject = e.streams[0];
       };
 
       const wsUrl = apiBase.replace(/^http/, 'ws') + `/ws/${stream_id}`;
-      console.log('[UI] opening WS →', wsUrl);
+      console.info(`[UI] opening WebSocket → ${wsUrl}`);
       const ws = new WebSocket(wsUrl);
+      streams[stream_id] = { pc, ws, container };
 
-      ws.onopen = () => console.log(`[UI][${stream_id}] WS open`);
+      ws.onopen = () => console.info(`[UI][${stream_id}] WS open`);
       ws.onerror = err => console.error(`[UI][${stream_id}] WS error`, err);
-      ws.onclose = () => console.log(`[UI][${stream_id}] WS closed`);
+      ws.onclose = () => console.info(`[UI][${stream_id}] WS closed`);
 
       ws.onmessage = async ev => {
         const msg = ev.data;
-        console.log(`[UI][${stream_id}] WS message:`, msg);
+        console.debug(`[UI][${stream_id}] WS message:`, msg);
         if (msg.startsWith('v=0')) {
-          // SDP offer from server
-          await pc.setRemoteDescription({ type:'offer', sdp: msg });
+          console.info(`[UI][${stream_id}] SDP offer received`);
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg });
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
-          console.log(`[UI][${stream_id}] sending SDP answer`);
+          console.info(`[UI][${stream_id}] sending SDP answer`);
           ws.send(answer.sdp);
         } else {
-          // ICE lines: "ICE:mlineIndex:candidate..."
           const iceMatch = msg.match(/^ICE:(\d+):(.*)$/);
           if (iceMatch) {
             const mline = parseInt(iceMatch[1]), cand = iceMatch[2];
-            console.log(`[UI][${stream_id}] adding ICE candidate`, mline, cand);
-            await pc.addIceCandidate({ sdpMLineIndex: mline, candidate: cand });
+            console.info(`[UI][${stream_id}] adding ICE candidate`);
+            try {
+              await pc.addIceCandidate({ sdpMLineIndex: mline, candidate: cand });
+            } catch (err) {
+              console.warn(`[UI][${stream_id}] addIceCandidate failed:`, err);
+            }
+          } else {
+            console.warn(`[UI][${stream_id}] unexpected WS message`, msg);
           }
         }
       };
-
-      streams[stream_id] = { pc, ws, container };
     }
 
     async function stopStream(stream_id) {
-      console.log('[UI] stopStream(', stream_id, ')');
-      await fetch(`${apiBase}/streams/${stream_id}`, { method:'DELETE' });
+      console.info(`[UI] stopStream(${stream_id})`);
+      try {
+        const resp = await fetch(`${apiBase}/streams/${stream_id}`, { method: 'DELETE' });
+        console.info('[UI] DELETE /streams →', resp.status);
+      } catch (err) {
+        console.error('[UI] stopStream HTTP error:', err);
+      }
       const { pc, ws, container } = streams[stream_id] || {};
       if (pc) pc.close();
       if (ws) ws.close();
@@ -163,12 +223,11 @@
       delete streams[stream_id];
     }
 
-    // Hook buttons
     document.getElementById('refreshBtn').onclick = loadCameras;
-    document.getElementById('startBtn').onclick   = startStream;
+    document.getElementById('startBtn').onclick = startStream;
 
-    // Kick things off
     loadCameras();
   </script>
 </body>
+
 </html>
