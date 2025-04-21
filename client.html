@@ -14,14 +14,22 @@
     <h2>Camera 1</h2>
     <video id="camera1" muted autoplay playsinline controls></video>
   </div>
-  <!-- <div>
+  <div>
     <h2>Camera 2</h2>
     <video id="camera2" muted autoplay playsinline controls></video>
-  </div> -->
+  </div>
+  <div>
+    <h2>Camera 3</h2>
+    <video id="camera3" muted autoplay playsinline controls></video>
+  </div>
+  <div>
+    <h2>Camera 4</h2>
+    <video id="camera4" muted autoplay playsinline controls></video>
+  </div>
 
   <script>
     const signalingUrl = "ws://localhost:8765";
-    const cameraIds   = ["camera1"];
+    const cameraIds   = ["camera1", "camera2","camera3", "camera4"];
     const pcs         = {};   // map cameraId → RTCPeerConnection
     const ws          = new WebSocket(signalingUrl);
 

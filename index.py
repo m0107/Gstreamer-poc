@@ -482,7 +482,12 @@ async def main():
     # Example usage: Adding multiple cameras
     camera_configs = [
         {"camera_id": "camera1", "camera_url": "rtsp://admin:Password@10.0.0.4:554/Streaming/Channels/101"},
-        # {"camera_id": "camera2", "camera_url": "rtsp://admin:Password@10.0.0.5:554/Streaming/Channels/101"}
+        {"camera_id": "camera2", "camera_url": "rtsp://admin:Password@10.0.0.4:554/Streaming/Channels/101"},
+        {"camera_id": "camera3", "camera_url": "rtsp://admin:Password@10.0.0.4:554/Streaming/Channels/101"},
+        {"camera_id": "camera4", "camera_url": "rtsp://admin:Password@10.0.0.4:554/Streaming/Channels/101"}
+
+
+
     ]
 
     for config in camera_configs:
