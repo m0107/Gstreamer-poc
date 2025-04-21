@@ -1,59 +1,53 @@
-// signaling_server.js
 const WebSocket = require('ws');
 
 const PORT = 8765;
 const wss = new WebSocket.Server({ port: PORT });
-const clients = new Set();
+const clients = new Map(); // Store clients with stream_id
 
-// Global variable to store the most recent offer message.
-let lastOfferMessage = null;
 wss.on('connection', (ws, req) => {
     const clientAddress = req.socket.remoteAddress;
     console.log(`[INFO] New client connected: ${clientAddress}`);
-    clients.add(ws);
-  
-    // Delay sending the stored offer (if any) by 100ms to ensure the client is ready.
-    if (lastOfferMessage) {
-      console.log(`[INFO] Sending stored offer to new client ${clientAddress}`);
-      setTimeout(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(lastOfferMessage);
-        }
-      }, 100);
-    }
-  
+
     ws.on('message', (message) => {
-      console.log(`[DEBUG] Received message from ${clientAddress}: ${message}`);
-  
-      let parsedMsg;
-      try {
-        parsedMsg = JSON.parse(message);
-      } catch (err) {
-        console.error("[ERROR] Invalid JSON message:", message);
-        return;
-      }
-  
-      // If this is an offer from the publisher, save it.
-      if (parsedMsg.type === "offer") {
-        lastOfferMessage = message;
-      }
-  
-      // Broadcast the message to all other connected clients.
-      clients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          console.log(`[DEBUG] Forwarding message to a client`);
-          client.send(message);
+        console.log(`[DEBUG] Received message from ${clientAddress}: ${message}`);
+        let parsedMsg;
+        try {
+            parsedMsg = JSON.parse(message);
+        } catch (err) {
+            console.error("[ERROR] Invalid JSON message:", message);
+            return;
         }
-      });
+
+        const streamId = parsedMsg.stream_id;
+        if (!streamId) {
+            console.error("[ERROR] Missing stream_id in message");
+            return;
+        }
+
+        if (parsedMsg.type === "register") {
+            // Register client with a stream_id
+            clients.set(ws, streamId);
+            console.log(`[INFO] Client ${clientAddress} registered for stream ${streamId}`);
+            return;
+        }
+
+        // Forward message to other clients with the same stream_id
+        clients.forEach((otherStreamId, client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN && otherStreamId === streamId) {
+                console.log(`[DEBUG] Forwarding message for stream ${streamId} to a client`);
+                client.send(message);
+            }
+        });
     });
-  
+
     ws.on('close', () => {
-      clients.delete(ws);
-      console.log(`[INFO] Client disconnected: ${clientAddress}`);
+        clients.delete(ws);
+        console.log(`[INFO] Client disconnected: ${clientAddress}`);
     });
-  
+
     ws.on('error', (err) => {
-      console.error(`[ERROR] Client error from ${clientAddress}: ${err}`);
+        console.error(`[ERROR] Client error from ${clientAddress}: ${err}`);
     });
-  });
-  
+});
+
+console.log(`Signaling server started on port ${PORT}`);

@@ -1,154 +1,67 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-  <meta charset="UTF-8" />
-  <title>GStreamer WebRTC Client (Advanced + Blob Fix)</title>
+  <meta charset="UTF-8">
+  <title>Multi‑Camera WebRTC Viewer</title>
   <style>
-    body {
-      font-family: sans-serif;
-    }
-
-    #remoteVideo {
-      width: 640px;
-      height: 360px;
-      background: black;
-    }
+    body { font-family: sans-serif; }
+    video { width: 480px; height: 270px; margin: .5rem; background: black; }
   </style>
 </head>
-
 <body>
-  <h1>GStreamer WebRTC Test (Perfect Negotiation + m‑line fix + Blob handling)</h1>
-  <video id="remoteVideo" autoplay playsinline controls></video>
+  <h1>Multi‑Camera WebRTC Viewer</h1>
   <div>
-    <button id="startBtn">Start WebSocket</button>
-    <p id="status"></p>
+    <h2>Camera 1</h2>
+    <video id="camera1" muted autoplay playsinline controls></video>
   </div>
+  <!-- <div>
+    <h2>Camera 2</h2>
+    <video id="camera2" muted autoplay playsinline controls></video>
+  </div> -->
 
   <script>
-    const SIGNALING_URL = "ws://localhost:8765";
-    const polite = true;            // this side yields on collision
-    let pc;                         // RTCPeerConnection
-    let ws;                         // WebSocket
-    let makingOffer = false;        // are we in the process of creating an offer?
-    let ignoreOffer = false;        // should we drop an incoming offer?
-    let remoteVideo, statusElem;
+    const signalingUrl = "ws://localhost:8765";
+    const cameraIds   = ["camera1"];
+    const pcs         = {};   // map cameraId → RTCPeerConnection
+    const ws          = new WebSocket(signalingUrl);
 
-    window.onload = () => {
-      remoteVideo = document.getElementById("remoteVideo");
-      statusElem = document.getElementById("status");
-      document.getElementById("startBtn").onclick = startSignaling;
+    ws.onopen = () => {
+      console.log("🟢 Connected to signaling server");
+      // Kick off one PeerConnection per camera
+      cameraIds.forEach(connectCamera);
     };
 
-    function log(msg) {
-      console.log("[STATUS]", msg);
-      statusElem.textContent = msg;
-    }
+    ws.onmessage = async ({ data }) => {
+      const msg = JSON.parse(data);
+      const { type, stream_id, sdp, candidate, sdpMid, sdpMLineIndex } = msg;
+      const pc = pcs[stream_id];
+      if (!pc) {
+        console.warn("No PC for", stream_id);
+        return;
+      }
 
-    function startSignaling() {
-      log("Connecting to signaling server…");
-      ws = new WebSocket(SIGNALING_URL);
+      if (type === "offer") {
+        // remote offered: set it, answer
+        await pc.setRemoteDescription({ type: "offer", sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type:"answer", stream_id, sdp: pc.localDescription.sdp });
 
-      ws.onopen = () => {
-        log("WebSocket open. Creating PeerConnection…");
-        createPeerConnection();
-      };
+      } else if (type === "answer") {
+        // we offered earlier; remote answered
+        await pc.setRemoteDescription({ type: "answer", sdp });
 
-      ws.onmessage = async (evt) => {
-        // —— Blob‑to‑text logic ——
-        let dataText;
-        if (evt.data instanceof Blob) {
-          dataText = await evt.data.text();
-          console.log("[WS] Received Blob → text");
-        } else {
-          dataText = evt.data;
-        }
+      } else if (type === "ice") {
+        // add remote ICE
+        await pc.addIceCandidate({ candidate, sdpMid, sdpMLineIndex });
+      }
+    };
 
-        console.log("[WS] Raw message:", dataText);
-        let msg;
-        try {
-          msg = JSON.parse(dataText);
-        } catch (e) {
-          console.error("[WS] Failed to parse JSON:", e, dataText);
-          return;
-        }
+    ws.onclose = () => console.log("🔴 Signaling connection closed");
+    ws.onerror = e => console.error("Signaling error", e);
 
-        // ———— SDP offer/answer handling ————
-        if (msg.type === "offer" || msg.type === "answer") {
-          const desc = new RTCSessionDescription(msg);
-          const isOffer = msg.type === "offer";
-          const collision = isOffer &&
-            (makingOffer || (pc && pc.signalingState !== "stable"));
-
-          ignoreOffer = !polite && collision;
-          if (ignoreOffer) {
-            console.warn("[WS] Collision – ignoring incoming offer");
-            return;
-          }
-
-          try {
-            log(`${msg.type.toUpperCase()} received; setting remote description…`);
-            if (!pc) {
-              console.log("[WS] Creating new RTCPeerConnection (inside offer)");
-              createPeerConnection();
-            }
-            await pc.setRemoteDescription(desc);
-
-            if (isOffer) {
-              log("Creating ANSWER…");
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              ws.send(JSON.stringify(pc.localDescription));
-              log("ANSWER sent.");
-            }
-          } catch (err) {
-            console.error("[WS] SDP negotiation failed:", err);
-
-            // **m‑line order mismatch:** rebuild
-            if (err.message.includes("order of m-lines")) {
-              console.warn("[WS] m‑line mismatch → recreating PeerConnection");
-              cleanupPeerConnection();
-              createPeerConnection();
-
-              // retry the exchange
-              try {
-                await pc.setRemoteDescription(desc);
-                if (isOffer) {
-                  const answer2 = await pc.createAnswer();
-                  await pc.setLocalDescription(answer2);
-                  ws.send(JSON.stringify(pc.localDescription));
-                  log("Re‑sent ANSWER after reset.");
-                }
-              } catch (err2) {
-                console.error("[WS] Retry negotiation failed:", err2);
-              }
-            }
-          }
-        }
-
-        // ———— ICE candidate handling ————
-        else if (msg.type === "ice") {
-          try {
-            await pc.addIceCandidate(msg.candidate);
-            console.log("[WS] Remote ICE added.");
-          } catch (e) {
-            console.warn("[WS] Failed to add remote ICE:", e);
-          }
-        }
-      };
-
-      ws.onclose = () => {
-        log("WebSocket closed.");
-        cleanupPeerConnection();
-      };
-      ws.onerror = (e) => {
-        console.error("[WS] WebSocket error:", e);
-        cleanupPeerConnection();
-      };
-    }
-
-    function createPeerConnection() {
-      const config = {
+    function connectCamera(cameraId) {
+      const pc = new RTCPeerConnection({
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           {
@@ -156,71 +69,49 @@
             username: "USERNAME",
             credential: "PASSWORD"
           }
-        ],
-        bundlePolicy: "balanced",
-        rtcpMuxPolicy: "require",
-        iceCandidatePoolSize: 1
-      };
-      pc = new RTCPeerConnection(config);
-      log("PeerConnection created.");
+        ]
+      });
+      pcs[cameraId] = pc;
 
-      // Perfect‐negotiation: only create an offer when needed
-      pc.onnegotiationneeded = async () => {
-        try {
-          makingOffer = true;
-          log("Negotiation needed → creating OFFER…");
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          ws.send(JSON.stringify(pc.localDescription));
-          log("OFFER sent.");
-        } catch (err) {
-          console.error("[WS] Failed to create/send offer:", err);
-        } finally {
-          makingOffer = false;
-        }
-      };
-
-      // send ICE
-      pc.onicecandidate = ({ candidate }) => {
+      // send our ICE to server
+      pc.onicecandidate = ({ candidate, sdpMid, sdpMLineIndex }) => {
         if (candidate) {
-          ws.send(JSON.stringify({
+          send({ 
             type: "ice",
             sdpMid: candidate.sdpMid,
             sdpMLineIndex: candidate.sdpMLineIndex,
-            candidate: candidate.candidate
-          }));
-        console.log("[WS] Local ICE sent.");
-      }
-    };
-
-    // display remote
-    pc.ontrack = ({ streams }) => {
-      console.log("[WS] Remote track arrived.");
-      remoteVideo.srcObject = streams[0];
-      remoteVideo.play().catch(e => console.warn("[WS] Video play error:", e));
-      log("Connected & streaming.");
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log("[WS] Connection state:", pc.connectionState);
-      if (pc.connectionState === "failed") {
-        log("ICE failed; restarting ICE.");
-        pc.restartIce();
-      }
-    };
+            candidate: candidate.candidate,
+            stream_id: cameraId
+          });
         }
+      };
 
-    function cleanupPeerConnection() {
-      if (!pc) return;
-      pc.onnegotiationneeded = null;
-      pc.onicecandidate = null;
-      pc.ontrack = null;
-      pc.onconnectionstatechange = null;
-      pc.close();
-      pc = null;
-      log("PeerConnection closed.");
+      // attach incoming video
+      pc.ontrack = ({ streams }) => {
+        const video = document.getElementById(cameraId);
+        video.srcObject = streams[0];
+        video.play().catch(console.warn);
+      };
+
+      // negotiation-needed → send offer
+      // pc.onnegotiationneeded = async () => {
+      //   try {
+      //     const offer = await pc.createOffer();
+      //     await pc.setLocalDescription(offer);
+      //     send({ type:"offer", stream_id:cameraId, sdp: pc.localDescription.sdp });
+      //   } catch (err) {
+      //     console.error("Negotiation error for", cameraId, err);
+      //   }
+      // };
+      pc.addTransceiver("video", { direction: "recvonly" });
+
+      // tell the server which stream we want
+      send({ type: "register", stream_id: cameraId });
+    }
+
+    function send(msg) {
+      ws.send(JSON.stringify(msg));
     }
   </script>
 </body>
-
 </html>
